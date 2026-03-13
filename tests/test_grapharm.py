@@ -1,5 +1,8 @@
 '''
-Test suite for GraphARM class
+Test suite for GraphARM class using B-rep CAD data format.
+
+Node features: x [N, 11]  (face_type, face_BBox×6, face_normal×3, loop_count)
+Edge features: edge_attr [E, 8]  (edge_type, convexity, edge_BBox×6)
 
 - test_predict_single_node: Test if (untrained) GraphArm can predict a single node 
                             correctly for a single-node masked graph
@@ -22,14 +25,28 @@ from grapharm import GraphARM
 from models import DiffusionOrderingNetwork, DenoisingNetwork
 from utils import NodeMasking
 
+# B-rep feature dimensions
+NODE_FEATURE_DIM = 11
+EDGE_FEATURE_DIM = 8
+NUM_FACE_TYPES = 3   # face_type values: 0, 1, 2 in the test graph
+NUM_EDGE_TYPES = 3   # edge_type values: 0, 1, 2 in the test graph
+
 @pytest.fixture
 def test_data():
-    # Create a mock dataset
-    x = torch.tensor([[0], [1], [5]], dtype=torch.float)
+    # 3-node B-rep graph
+    x = torch.tensor([
+        [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 1.0, 0.0, 1],
+        [1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0, 0.0, 0.0, 2],
+        [2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.0, 0.0, 1.0, 1],
+    ], dtype=torch.float)
     edge_index = torch.tensor([[0, 1, 2, 0], [1, 2, 0, 2]], dtype=torch.long)
-    edge_attr = torch.tensor([0, 1, 2, 0], dtype=torch.float)
-    datapoint = torch_geometric.data.Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-    return datapoint
+    edge_attr = torch.tensor([
+        [0, 1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        [1, 0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+        [2, 2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+        [0, 1, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    ], dtype=torch.float)
+    return torch_geometric.data.Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 class TestGraphARM:
     @pytest.fixture(autouse=True)
@@ -37,16 +54,16 @@ class TestGraphARM:
         self.test_data = test_data
         self.test_masker = NodeMasking(test_data)
         denoising_network = DenoisingNetwork(
-            node_feature_dim=1,
-            edge_feature_dim=1,
-            num_node_types=self.test_data.x.unique().shape[0],
-            num_edge_types=self.test_data.edge_attr.unique().shape[0],
+            node_feature_dim=NODE_FEATURE_DIM,
+            edge_feature_dim=EDGE_FEATURE_DIM,
+            num_node_types=NUM_FACE_TYPES,
+            num_edge_types=NUM_EDGE_TYPES,
             device=torch.device('cpu')
             )
         diffusion_ordering_network = DiffusionOrderingNetwork(
-            node_feature_dim=1,
-            num_edge_types=self.test_data.edge_attr.unique().shape[0],
-            num_node_types=self.test_data.x.unique().shape[0],
+            node_feature_dim=NODE_FEATURE_DIM,
+            num_edge_types=NUM_EDGE_TYPES,
+            num_node_types=NUM_FACE_TYPES,
             device=torch.device('cpu')
             )
         self.grapharm = GraphARM(dataset=test_data, denoising_network=denoising_network, diffusion_ordering_network=diffusion_ordering_network, device=torch.device('cpu'))
@@ -57,9 +74,9 @@ class TestGraphARM:
         # Test if GraphARM can predict a single node correctly for a single-node masked graph
         predicted_node_type, predicted_connection_types = self.grapharm.predict_new_node(self.empty_graph, sampling_method='sample', preprocess=False)
         # Assert that predicted node type is a number in the range of node types
-        assert predicted_node_type in range(self.test_data.x.unique().shape[0])
+        assert predicted_node_type in range(NUM_FACE_TYPES)
         # Assert that predicted connection types are numbers in the range of edge types, +1 for the empty connection type
-        assert all([connection_type in range(self.test_data.edge_attr.unique().shape[0]+1) for connection_type in predicted_connection_types])
+        assert all([connection_type in range(NUM_EDGE_TYPES+1) for connection_type in predicted_connection_types])
         return predicted_node_type, predicted_connection_types
     
     def test_predict_and_add_node(self, test_data):
@@ -67,10 +84,10 @@ class TestGraphARM:
         # Test if NodeMasking correctly adds the predicted node to the graph
         predicted_node_type, predicted_connection_types = self.grapharm.predict_new_node(new_graph, sampling_method='sample', preprocess=False)
         new_graph = self.test_masker.demask_node(new_graph, new_graph.x.shape[0]-1, predicted_node_type, predicted_connection_types)
-        # Assert that the new graph has the new node type
-        assert predicted_node_type in new_graph.x
-        # Assert that there are no masked edges in the new graph (no occurrence of masker.EDGE_MASK)
-        assert self.test_masker.EDGE_MASK not in new_graph.edge_attr
+        # Assert that the new graph has the new node type in its face_type column
+        assert predicted_node_type in new_graph.x[:, 0]
+        # Assert that there are no masked edges in the new graph (no EDGE_MASK in type dim)
+        assert self.test_masker.EDGE_MASK not in new_graph.edge_attr[:, 0]
 
         # Assert that the new graph has the correct number of nodes
         assert new_graph.x.shape[0] == test_data.x.shape[0] + 1
@@ -99,15 +116,16 @@ class TestGraphARM:
         diffusion_trajectory, node_order, sigma_t_dist = diffusion_trajectory
 
         # Assert that there's no masked nodes in the first graph
-        assert self.test_masker.NODE_MASK not in diffusion_trajectory[0].x
+        assert self.test_masker.NODE_MASK not in diffusion_trajectory[0].x[:, 0]
         
         for t in range(1, len(sigma_t_dist)):
             # Assert each graph is fully connected
             assert diffusion_trajectory[t].edge_index.shape[1] == diffusion_trajectory[t].x.shape[0] ** 2
             # Assert that there's a single masked node in each graph
-            assert torch.sum(diffusion_trajectory[t].x == self.test_masker.NODE_MASK) == 1
-            # Assert that there's N masked edges in each graph
-            assert torch.sum(diffusion_trajectory[t].edge_attr == self.test_masker.EDGE_MASK) == 2*diffusion_trajectory[t].x.shape[0] - 1
+            assert torch.sum(diffusion_trajectory[t].x[:, 0] == self.test_masker.NODE_MASK) == 1
+            # Assert that there's 2N-1 masked edges in each graph (dim 0 of edge_attr)
+            assert torch.sum(diffusion_trajectory[t].edge_attr[:, 0] == self.test_masker.EDGE_MASK) == \
+                   2 * diffusion_trajectory[t].x.shape[0] - 1
             
             
     def test_diffusion_trajectory_final_state(self, diffusion_trajectory):
@@ -115,15 +133,16 @@ class TestGraphARM:
         # Check if last graph in diffusion_trajectory is a single-node masked graph
         assert diffusion_trajectory[-1].x.shape[0] == 1
         assert torch.allclose(diffusion_trajectory[-1].edge_index, torch.tensor([[0], [0]]))
-        assert torch.allclose(diffusion_trajectory[-1].edge_attr, torch.tensor([self.test_masker.EDGE_MASK]))
+        # The single self-loop edge should be EDGE_MASK in dim 0
+        assert diffusion_trajectory[-1].edge_attr[0, 0] == self.test_masker.EDGE_MASK
 
     def test_predict_single_node(self):
         # Test if GraphARM can predict a single node correctly for a single-node masked graph
         predicted_node_type, predicted_connection_types = self.grapharm.predict_new_node(self.empty_graph, sampling_method='sample', preprocess=False)
-        # Assert that predicted node type is a number in the range of node types (according to the unique node types in the dataset)
-        assert predicted_node_type in range(self.test_data.x.unique().shape[0])
-        # Assert that predicted connection types are numbers in the range of edge types, +1 for the empty connection type
-        assert all([connection_type in range(self.test_data.edge_attr.unique().shape[0]+1) for connection_type in predicted_connection_types])
+        # Assert that predicted node type is in the range of node types
+        assert predicted_node_type in range(NUM_FACE_TYPES)
+        # Assert that predicted connection types are in the range of edge types, +1 for the empty connection type
+        assert all([connection_type in range(NUM_EDGE_TYPES+1) for connection_type in predicted_connection_types])
     
     def test_generate_sample_graph(self):
         # Generate a new graph with 5 nodes
@@ -136,16 +155,17 @@ class TestGraphARM:
         node_type, connections = self.grapharm.predict_new_node(gen_graph, sampling_method='sample', preprocess=False)
         gen_graph = self.test_masker.demask_node(gen_graph, 4, node_type, connections)
 
-        # remove masker.EMPTY_EDGE from edge_attr, and equivalent in edge_index
-        gen_graph.edge_index = gen_graph.edge_index[:, gen_graph.edge_attr.squeeze() != self.test_masker.EMPTY_EDGE]
-        gen_graph.edge_attr = gen_graph.edge_attr[gen_graph.edge_attr.squeeze() != self.test_masker.EMPTY_EDGE]
+        # remove EMPTY_EDGE from edge_attr (check dim 0)
+        keep = gen_graph.edge_attr[:, 0].squeeze() != self.test_masker.EMPTY_EDGE
+        gen_graph.edge_index = gen_graph.edge_index[:, keep]
+        gen_graph.edge_attr = gen_graph.edge_attr[keep]
         
         # Assert that the generated graph has the correct number of nodes
         assert gen_graph.x.shape[0] == 5
         # Assert that there are no masked nodes in the generated graph
-        assert self.test_masker.NODE_MASK not in gen_graph.x
+        assert self.test_masker.NODE_MASK not in gen_graph.x[:, 0]
         # Assert that there are no masked edges in the generated graph
-        assert self.test_masker.EDGE_MASK not in gen_graph.edge_attr
+        assert self.test_masker.EDGE_MASK not in gen_graph.edge_attr[:, 0]
         
     def test_compute_nll_node(self):
         # Test if GraphARM can compute the negative log likelihood of a node type

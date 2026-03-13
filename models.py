@@ -52,24 +52,20 @@ class DiffusionOrderingNetwork(nn.Module):
         self.device = device
         self.hidden_dim = hidden_dim
         self.out_channels = out_channels
+        self.node_feature_dim = node_feature_dim
 
         num_node_types += 1 # add one for masked node type
         num_edge_types += 2 # add one for masked edge type and one for empty edge type
-        
 
-        # add positional encodings into node features
+        # Embedding for the discrete node type (x[:, 0])
         self.embedding = nn.Embedding(num_embeddings=num_node_types, embedding_dim=hidden_dim).to(self.device)
 
-        # self.gat = GAT(
-        #     in_channels=hidden_dim,
-        #     out_channels=out_channels,
-        #     hidden_channels=hidden_dim * num_heads,
-        #     num_layers=num_layers,
-        #     dropout=0,
-        #     heads=hidden_dim,
-        #     residual=True
-        # )
-        
+        # Optional projection for continuous node features (x[:, 1:])
+        if node_feature_dim > 1:
+            self.cont_proj = nn.Linear(node_feature_dim - 1, hidden_dim).to(self.device)
+        else:
+            self.cont_proj = None
+
         # Create an instance of the RGCN model
         self.gat = RGCN(num_relations=num_edge_types,
                         hidden_dim=self.hidden_dim,
@@ -103,12 +99,22 @@ class DiffusionOrderingNetwork(nn.Module):
         # list of not absorbed nodes (G.x.shape[0], except for nodes in node_order)
         unmasked = torch.tensor([node for node in range(G.x.shape[0]) if node not in node_order], device=self.device)
 
-        h = self.embedding(G.x.squeeze().long().to(self.device))
+        # Support both 1-D (legacy) and multi-dim node features.
+        # Embed the discrete type dimension (dim 0).
+        x = G.x if G.x.dim() == 2 else G.x.unsqueeze(-1)
+        h = self.embedding(x[:, 0].long().to(self.device))
 
-        # # Positional encoding
+        # Add continuous-feature embedding if available (dims 1+)
+        if self.cont_proj is not None and x.shape[1] > 1:
+            h = h + self.cont_proj(x[:, 1:].float().to(self.device))
+
+        # Positional encoding for already-absorbed nodes
         for t in range(len(node_order)):
             h[node_order[t], :] += self.pe[t, :].to(self.device)
-        h = self.gat(h, G.edge_index.long().to(self.device), G.edge_attr.long().to(self.device))
+
+        # Use the discrete edge type (dim 0) as RGCN relation type
+        ea = G.edge_attr if G.edge_attr.dim() == 1 else G.edge_attr[:, 0]
+        h = self.gat(h, G.edge_index.long().to(self.device), ea.long().to(self.device))
 
         if unmasked.numel() > 0:
             h_unmasked = h[unmasked, :]
@@ -199,10 +205,14 @@ class DenoisingNetwork(nn.Module):
     def forward(self, x, edge_index, edge_attr, v_t=None):
         # make sure x and edge_attr are of type float, for the MLPs
         x = x.float().to(self.device)
+
+        # Ensure edge_attr is 2-D [E, edge_feature_dim]
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
         edge_attr = edge_attr.float().to(self.device)
 
         h_v = self.node_embedding(x)
-        h_e = self.edge_embedding(edge_attr.reshape(-1, 1))
+        h_e = self.edge_embedding(edge_attr.reshape(-1, self.edge_embedding.in_features))
         
         for l in range(self.num_layers):
             h_v = self.layers[l](h_v, edge_index, h_e)

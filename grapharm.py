@@ -134,13 +134,24 @@ class GraphARM(nn.Module):
             sigma_t_dist = sigma_t[t]
             sigma_t_dist = sigma_t_dist[sigma_t_dist != 0]
 
-            original_node_type = G_0.x[node_order_invariate[t]]
+            # Extract the discrete node type (face_type, dim 0) for the target node
+            node_feat = G_0.x[node_order_invariate[t]]
+            if node_feat.dim() > 0 and node_feat.numel() > 1:
+                original_node_type = node_feat[0].long()
+            else:
+                original_node_type = node_feat.squeeze().long()
             nll_node = self.compute_nll_node(node_type_probs, original_node_type, sigma_t_dist)
             # get original edge type for each edge in G_0
-            
-            original_edge_types = G_0.edge_attr[(G_0.edge_index[0] == node_order_invariate[t]) & 
-                                              (torch.tensor([G_0.edge_index[1][i] in node_order_invariate[t:] 
-                                                             for i in range(G_0.edge_index.shape[1])]))]
+            edge_mask = (G_0.edge_index[0] == node_order_invariate[t]) & \
+                        (torch.tensor([G_0.edge_index[1][i] in node_order_invariate[t:]
+                                       for i in range(G_0.edge_index.shape[1])]))
+
+            # Extract the discrete edge type (edge_type, dim 0) for the target edges
+            ea_0 = G_0.edge_attr[edge_mask]
+            if ea_0.dim() == 2:
+                original_edge_types = ea_0[:, 0].long()
+            else:
+                original_edge_types = ea_0.long()
             nll_edge = self.compute_nll_edge(edge_type_probs, original_edge_types)
 
             loss += nll_node + nll_edge

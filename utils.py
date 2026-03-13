@@ -9,188 +9,295 @@ def random_node_decay_ordering(datapoint):
 class NodeMasking:
     def __init__(self, dataset):
         self.dataset = dataset
-        assert dataset.x.shape[1] == 1, "Only one feature per node is supported"
-        
-        self.NODE_MASK = dataset.x.unique().shape[0]
-        self.EMPTY_EDGE = dataset.edge_attr.unique().shape[0]
-        self.EDGE_MASK = dataset.edge_attr.unique().shape[0] + 1
-    
+
+        # Support both 1-D and multi-dim node features [N, D].
+        # The first feature dimension (dim 0) is the discrete type used for
+        # masking/classification; remaining dims are continuous attributes.
+        x = dataset.x if dataset.x.dim() == 2 else dataset.x.unsqueeze(-1)
+        self.node_feature_dim = x.shape[1]
+
+        # Support both 1-D and multi-dim edge features [E, D].
+        # dim 0 is the discrete edge type.
+        if dataset.edge_attr.dim() == 2:
+            edge_attr = dataset.edge_attr
+        else:
+            edge_attr = dataset.edge_attr.unsqueeze(-1)
+        self.edge_feature_dim = edge_attr.shape[1]
+
+        # Special token indices (based on the type dimension, dim 0).
+        self.NODE_MASK = int(x[:, 0].unique().shape[0])
+        self.EMPTY_EDGE = int(edge_attr[:, 0].unique().shape[0])
+        self.EDGE_MASK = self.EMPTY_EDGE + 1
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _to_2d(self, tensor):
+        '''Ensure tensor is 2-D [N, D]; expands 1-D [N] → [N, 1].'''
+        if tensor is None:
+            return tensor
+        return tensor if tensor.dim() == 2 else tensor.unsqueeze(-1)
+
+    def _node_mask_features(self):
+        '''Feature vector for a masked node: type=NODE_MASK, rest=0.'''
+        feat = torch.zeros(self.node_feature_dim)
+        feat[0] = self.NODE_MASK
+        return feat
+
+    def _edge_mask_features(self):
+        '''Feature vector for a masked edge: type=EDGE_MASK, rest=0.'''
+        feat = torch.zeros(self.edge_feature_dim)
+        feat[0] = self.EDGE_MASK
+        return feat
+
+    def _empty_edge_features(self):
+        '''Feature vector for an empty (absent) edge: type=EMPTY_EDGE, rest=0.'''
+        feat = torch.zeros(self.edge_feature_dim)
+        feat[0] = self.EMPTY_EDGE
+        return feat
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def idxify(self, datapoint):
         '''
-        Converts node and edge types to indices starting from 0
+        Converts the discrete type dimensions (x[:,0] and edge_attr[:,0]) to
+        contiguous 0-based indices.  Continuous feature dimensions are unchanged.
         '''
         datapoint = datapoint.clone()
-        unique_node_types = {node_type.item(): idx for idx, node_type in enumerate(datapoint.x.unique())}
-        unique_edge_types = {edge_type.item(): idx for idx, edge_type in enumerate(datapoint.edge_attr.unique())}
-        
-        datapoint.x = torch.tensor([unique_node_types[node_type.item()] for node_type in datapoint.x]).reshape(-1, 1)
-        datapoint.edge_attr = torch.tensor([unique_edge_types[edge_type.item()] for edge_type in datapoint.edge_attr])
+        x = self._to_2d(datapoint.x).clone()
+        ea = self._to_2d(datapoint.edge_attr).clone()
+
+        # Re-index node type (dim 0)
+        unique_node_types = {nt.item(): idx for idx, nt in enumerate(x[:, 0].unique())}
+        x[:, 0] = torch.tensor([unique_node_types[nt.item()] for nt in x[:, 0]],
+                                dtype=x.dtype)
+
+        # Re-index edge type (dim 0)
+        unique_edge_types = {et.item(): idx for idx, et in enumerate(ea[:, 0].unique())}
+        ea[:, 0] = torch.tensor([unique_edge_types[et.item()] for et in ea[:, 0]],
+                                 dtype=ea.dtype)
+
+        datapoint.x = x
+        datapoint.edge_attr = ea
         return datapoint
-    
+
     def deidxify(self, datapoint):
         '''
-        Converts node and edge indices back to their original types
+        Converts contiguous type indices back to their original values.
         '''
         datapoint = datapoint.clone()
-        unique_node_types = {idx: node_type.item() for idx, node_type in enumerate(datapoint.x.unique())}
-        unique_edge_types = {idx: edge_type.item() for idx, edge_type in enumerate(datapoint.edge_attr.unique())}
-        
-        datapoint.x = torch.tensor([unique_node_types.get(node_idx.item(), self.NODE_MASK) for node_idx in datapoint.x]).reshape(-1, 1)
-        datapoint.edge_attr = torch.tensor([unique_edge_types.get(edge_idx.item(), self.EDGE_MASK) for edge_idx in datapoint.edge_attr])
+        x = self._to_2d(datapoint.x).clone()
+        ea = self._to_2d(datapoint.edge_attr).clone()
+
+        unique_node_types = {idx: nt.item() for idx, nt in enumerate(x[:, 0].unique())}
+        unique_edge_types = {idx: et.item() for idx, et in enumerate(ea[:, 0].unique())}
+
+        x[:, 0] = torch.tensor([unique_node_types.get(nt.item(), self.NODE_MASK)
+                                 for nt in x[:, 0]], dtype=x.dtype)
+        ea[:, 0] = torch.tensor([unique_edge_types.get(et.item(), self.EDGE_MASK)
+                                  for et in ea[:, 0]], dtype=ea.dtype)
+
+        datapoint.x = x
+        datapoint.edge_attr = ea
         return datapoint
 
     def is_masked(self, datapoint, node=None):
         '''
-        returns if node is masked or not, or array of masked nodes if node == None
+        Returns whether node(s) are masked, based on the type dimension (dim 0).
         '''
+        x = self._to_2d(datapoint.x)
         if node is None:
-            return datapoint.x == self.NODE_MASK
-        return datapoint.x[node] == self.NODE_MASK
+            return x[:, 0] == self.NODE_MASK
+        return x[node, 0] == self.NODE_MASK
 
     def remove_node(self, datapoint, node):
         '''
-        Removes node from graph, and all edges connected to it
+        Removes a node from the graph together with all its edges.
         '''
         assert node < datapoint.x.shape[0], "Node does not exist"
         if datapoint.x.shape[0] == 1:
             return datapoint.clone()
         datapoint = datapoint.clone()
-        # remove node
-        datapoint.x = torch.cat([datapoint.x[:node], datapoint.x[node+1:]])
 
-        
-        # remove edges from edge_index (remove elements containing node in tuple of edge_index) (if datapoint.edge_index[:, 0] == node or datapoint.edge_index[:, 1] == node)
+        # Remove node features
+        datapoint.x = torch.cat([datapoint.x[:node], datapoint.x[node + 1:]])
+
         if datapoint.edge_index.shape[1] > 1:
-
-            # remove edges (remove elements containing node)
-            datapoint.edge_attr = torch.tensor([edge_attr for edge_attr, edge_index in zip(datapoint.edge_attr, datapoint.edge_index.T) if node not in edge_index])
-
-            edge_index_T = torch.stack([edge_index_tuple for edge_index_tuple in datapoint.edge_index.T if node not in edge_index_tuple])
-            datapoint.edge_index = edge_index_T.T
-            # update indices of edge_index
+            # Keep only edges that do not involve the removed node
+            keep = torch.tensor([node not in ei for ei in datapoint.edge_index.T])
+            ea = self._to_2d(datapoint.edge_attr)
+            datapoint.edge_attr = ea[keep]
+            datapoint.edge_index = datapoint.edge_index[:, keep]
+            # Shift indices above the removed node
             datapoint.edge_index[datapoint.edge_index > node] -= 1
         return datapoint
 
     def add_masked_node(self, datapoint):
         '''
-        Adds a masked node to the graph
+        Appends a fully-masked node and connects it (with masked edges) to all
+        existing nodes.
         '''
         datapoint = datapoint.clone()
         n_nodes = datapoint.x.shape[0]
-        datapoint.x = torch.cat([datapoint.x.reshape(-1,1), torch.tensor([[self.NODE_MASK]])], dim=0)
-        datapoint.edge_attr = torch.cat([datapoint.edge_attr.reshape(-1,1), torch.tensor([self.EDGE_MASK]).repeat(n_nodes+1, 1)], dim=0)
-        new_edges = torch.tensor([(node, n_nodes) for node in range(n_nodes+1)], dtype=torch.long).transpose(1,0)
-        datapoint.edge_index = torch.cat([datapoint.edge_index, new_edges], dim=1)
-        return datapoint
+        x = self._to_2d(datapoint.x)
+        ea = self._to_2d(datapoint.edge_attr)
 
+        # New masked node
+        new_node = self._node_mask_features().unsqueeze(0)
+        datapoint.x = torch.cat([x, new_node], dim=0)
+
+        # Masked edges for the new node (one edge from each existing node + self)
+        new_edges_feat = self._edge_mask_features().unsqueeze(0).expand(n_nodes + 1, -1).clone()
+        datapoint.edge_attr = torch.cat([ea, new_edges_feat], dim=0)
+
+        new_ei = torch.tensor([(i, n_nodes) for i in range(n_nodes + 1)],
+                               dtype=torch.long).transpose(1, 0)
+        datapoint.edge_index = torch.cat([datapoint.edge_index, new_ei], dim=1)
+        return datapoint
 
     def mask_node(self, datapoint, selected_node):
         '''
-        Masking node mechanism
-        1. Masked node (x = -1)
-        2. Connected to all other nodes in graph by masked edges (edge_attr = -1)
-        
-        datapoint.x: node feature matrix
-        datapoint.edge_index: edge index matrix
-        datapoint.edge_attr: edge attribute matrix
-        datapoint.y: target value
+        Masks a node: replaces its features with the NODE_MASK sentinel and
+        sets all incident edges to EDGE_MASK.
         '''
-        # mask node
         datapoint = datapoint.clone()
-        datapoint.x[selected_node] = self.NODE_MASK
-        
-        # mask edges
-        datapoint.edge_attr[datapoint.edge_index[0] == selected_node] = self.EDGE_MASK
-        datapoint.edge_attr[datapoint.edge_index[1] == selected_node] = self.EDGE_MASK
+        x = self._to_2d(datapoint.x).clone()
+        ea = self._to_2d(datapoint.edge_attr).clone()
+
+        x[selected_node] = self._node_mask_features()
+
+        src_mask = datapoint.edge_index[0] == selected_node
+        dst_mask = datapoint.edge_index[1] == selected_node
+        ea[src_mask] = self._edge_mask_features()
+        ea[dst_mask] = self._edge_mask_features()
+
+        datapoint.x = x
+        datapoint.edge_attr = ea
         return datapoint
-    
+
     def _reorder_edge_attr_and_index(self, graph):
         '''
-        Reorders edge_attr and edge_index to be like on nx graph
-        (0, 0), (0, 1), (0, 2), ..., (0, n), (1, 0), (1, 1), ..., (n, n)
+        Reorders edge_attr and edge_index into dense (i,j) order.
         '''
         graph = graph.clone()
-        # reorder edge_attr
-        edge_attr = torch.full((graph.x.shape[0], graph.x.shape[0]), self.EMPTY_EDGE, dtype=torch.long)
-        for edge_attr_value, edge_index in zip(graph.edge_attr, graph.edge_index.T):
-            edge_attr[edge_index[0], edge_index[1]] = edge_attr_value
-        graph.edge_attr = edge_attr.view(-1)
-        
-        # reorder edge_index
-        edge_index = torch.stack([torch.tensor([i, j]) for i in range(graph.x.shape[0]) for j in range(graph.x.shape[0])], dim=1)
-        graph.edge_index = edge_index.long()
-        return graph
+        n = graph.x.shape[0]
+        ea = self._to_2d(graph.edge_attr)
 
+        full_ea = self._empty_edge_features().unsqueeze(0).expand(n * n, -1).clone()
+        for ea_row, ei in zip(ea, graph.edge_index.T):
+            full_ea[ei[0] * n + ei[1]] = ea_row
+
+        graph.edge_attr = full_ea
+        graph.edge_index = torch.stack(
+            [torch.tensor([i, j]) for i in range(n) for j in range(n)], dim=1
+        ).long()
+        return graph
 
     def remove_empty_edges(self, graph):
         '''
-        Removes empty edges from graph
+        Removes EMPTY_EDGE entries from the graph.
         '''
         graph = graph.clone()
-        # remove masker.EMPTY_EDGE from edge_attr, and equivalent in edge_index
-        graph.edge_index = graph.edge_index[:, graph.edge_attr.squeeze() != self.EMPTY_EDGE]
-        graph.edge_attr = graph.edge_attr[graph.edge_attr.squeeze() != self.EMPTY_EDGE]
-
+        ea = self._to_2d(graph.edge_attr)
+        keep = ea[:, 0].squeeze() != self.EMPTY_EDGE
+        graph.edge_index = graph.edge_index[:, keep]
+        graph.edge_attr = ea[keep]
         return graph
 
     def demask_node(self, graph, selected_node, node_type, connections_types):
         '''
-        Demasking node mechanism
-        1. Unmasked node (graph.x = node_type)
-        2. Connected to all other nodes in graph by unmasked edges (graph.edge_attr <= connections_types)
+        Unmasks a node.
+
+        Parameters
+        ----------
+        node_type : scalar tensor or 1-D feature vector
+            If scalar (or single-element tensor), sets only the type dimension
+            (dim 0) of the node feature.  If a full feature vector is supplied
+            its length must equal node_feature_dim.
+        connections_types : 1-D tensor [N]
+            Edge-type indices for edges from each existing node to selected_node.
         '''
-        assert connections_types.shape[0] == graph.x.shape[0], "Number of connections must be equal to number of nodes"
-        
-        # demask node
+        assert connections_types.shape[0] == graph.x.shape[0], \
+            "Number of connections must equal number of nodes"
+
         graph = graph.clone()
-        graph.x[selected_node] = node_type
-        # demask edge_attr
+        x = self._to_2d(graph.x).clone()
+        ea = self._to_2d(graph.edge_attr).clone()
+
+        # Set node features FIRST so is_masked() returns the updated state
+        # when we iterate over edges below (handles the self-loop case).
+        nt = torch.as_tensor(node_type)
+        if nt.dim() == 0 or nt.numel() == 1:
+            x[selected_node, 0] = nt.squeeze().to(x.dtype)
+        else:
+            x[selected_node] = nt.to(x.dtype)
+        graph.x = x  # propagate the update before the edge loop
+
+        # Set edge features
         for i, connection in enumerate(connections_types):
             if not self.is_masked(graph, node=i):
-                graph.edge_attr[torch.logical_and(graph.edge_index[0] == i, graph.edge_index[1] == selected_node)] = connection
-                graph.edge_attr[torch.logical_and(graph.edge_index[1] == i, graph.edge_index[0] == selected_node)] = connection
-        
+                ct = torch.as_tensor(connection)
+                mask1 = torch.logical_and(graph.edge_index[0] == i,
+                                          graph.edge_index[1] == selected_node)
+                mask2 = torch.logical_and(graph.edge_index[1] == i,
+                                          graph.edge_index[0] == selected_node)
+                if ct.dim() == 0 or ct.numel() == 1:
+                    ea[mask1, 0] = ct.squeeze().to(ea.dtype)
+                    ea[mask2, 0] = ct.squeeze().to(ea.dtype)
+                else:
+                    ea[mask1] = ct.to(ea.dtype)
+                    ea[mask2] = ct.to(ea.dtype)
+
+        graph.edge_attr = ea
         return graph
+
     def fully_connect(self, graph, keep_original_edges=True):
         '''
-        Fully connect graph with edge attribute value
+        Fully connects the graph; missing edges receive EMPTY_EDGE features.
         '''
         adjacency_matrix = to_dense_adj(graph.edge_index)[0]
         adjacency_matrix[adjacency_matrix == 0] = 1
 
+        n = graph.x.shape[0]
         fully_connected = graph.clone()
-        fully_connected.edge_attr = torch.ones(fully_connected.x.shape[0]**2) * self.EMPTY_EDGE
-        
-        fully_connected.edge_attr = fully_connected.edge_attr.long()
+        ea = self._to_2d(graph.edge_attr)
+
+        empty_feat = self._empty_edge_features()
+        full_ea = empty_feat.unsqueeze(0).expand(n * n, -1).clone()
 
         if keep_original_edges:
-            # restore values of original edges
-            for edge_attr, edge_index in zip(graph.edge_attr, graph.edge_index.T):
-                fully_connected.edge_attr[edge_index[0] * fully_connected.x.shape[0] + edge_index[1]] = edge_attr
-                fully_connected.edge_attr[edge_index[1] * fully_connected.x.shape[0] + edge_index[0]] = edge_attr  # Ensure symmetry
+            for ea_row, ei in zip(ea, graph.edge_index.T):
+                i, j = ei[0].item(), ei[1].item()
+                full_ea[i * n + j] = ea_row
+                full_ea[j * n + i] = ea_row  # Ensure symmetry
 
+        fully_connected.edge_attr = full_ea
         fully_connected.edge_index = torch.nonzero(adjacency_matrix).T
         return fully_connected
-    
+
     def generate_fully_masked(self, n_nodes):
         '''
-        Generates a fully masked graph like the one provided
+        Generates a fully-masked graph (all nodes and edges masked).
         '''
-        
-        fully_masked = Data(
-            x=torch.ones((n_nodes, 1))*self.NODE_MASK,
-            edge_index=torch.tensor([(i, j) for i in range(n_nodes) for j in range(n_nodes)], dtype=torch.int64).transpose(0,1),
-            edge_attr=torch.ones(n_nodes**2)*self.EDGE_MASK,
-        )
-        return fully_masked
+        node_feat = self._node_mask_features()
+        x = node_feat.unsqueeze(0).expand(n_nodes, -1).clone()
+
+        edge_feat = self._edge_mask_features()
+        ea = edge_feat.unsqueeze(0).expand(n_nodes * n_nodes, -1).clone()
+
+        edge_index = torch.tensor(
+            [(i, j) for i in range(n_nodes) for j in range(n_nodes)],
+            dtype=torch.int64
+        ).transpose(0, 1)
+
+        return Data(x=x, edge_index=edge_index, edge_attr=ea)
 
     def get_denoised_nodes(self, graph):
         '''
-        Returns a list of nodes that are denoised
+        Returns a list of node indices that are not masked.
         '''
-        denoised_nodes = []
-        for node in range(graph.x.shape[0]):
-            if not self.is_masked(graph, node):
-                denoised_nodes.append(node)
-
-        return denoised_nodes
+        return [node for node in range(graph.x.shape[0])
+                if not self.is_masked(graph, node)]
